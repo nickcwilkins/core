@@ -46,6 +46,14 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         """Get the options flow for this handler."""
         return QueensGuardOptionsFlowHandler(config_entry)
 
+    def __init__(self) -> None:
+        """Initialize config flow."""
+        self.url: str | None = None
+        self.model: str | None = None
+        self.ollama_client: ollama.AsyncClient | None = None
+        self.download_task: asyncio.Task | None = None
+        self.chroma_client: chromadb.Client | None = None
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -162,7 +170,9 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             # parse the url
             parsed_url = urlparse(url)
-            chromadb.HttpClient(host=parsed_url.hostname, port=parsed_url.port)
+            self.chroma_client = chromadb.HttpClient(
+                host=parsed_url.hostname, port=parsed_url.port
+            )
         except TimeoutError:
             _LOGGER.exception("Timeout connecting to ChromaDB at %s", url)
             return "timeout"
@@ -182,11 +192,13 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         """
         try:
             # Create ollama client with the provided URL
-            client = ollama.AsyncClient(host=url, verify=get_default_context())
+            self.ollama_client = ollama.AsyncClient(
+                host=url, verify=get_default_context()
+            )
 
             # Test the connection by listing available models
             async with asyncio.timeout(DEFAULT_TIMEOUT):
-                response = await client.list()
+                response = await self.ollama_client.list()
 
             # Verify the response contains models data
             if "models" not in response:
