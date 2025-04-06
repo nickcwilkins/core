@@ -6,10 +6,12 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.llm import async_register_api
 from homeassistant.helpers.typing import ConfigType
 
 from .api import QueensGuardAPI
 from .const import CONF_CHROMA_URL, CONF_OLLAMA_URL, DOMAIN
+from .embeddings import EmbeddingManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,46 +26,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     chroma_url = entry.data.get(CONF_CHROMA_URL)
     ollama_url = entry.data.get(CONF_OLLAMA_URL)
 
-    # Create the API instance
-    api = QueensGuardAPI(hass, chroma_url, ollama_url)
+    # Create the embedding manager
+    embedding_manager = EmbeddingManager(hass, chroma_url, ollama_url)
 
-    # Set up the API's embedding listeners
-    await api.async_setup_embedding_listeners()
+    # Set up embedding listeners
+    await embedding_manager.async_setup()
 
-    # Store the API instance in the hass data registry
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = api
+    # Create the API instance with a reference to the embedding manager
+    api = QueensGuardAPI(hass, chroma_url, ollama_url, embedding_manager)
 
     # Register the API with Home Assistant's LLM system
-    # In Home Assistant 2025+, the LLM API is registered via a direct call
-    service_name = "register_api"
-    if hass.services.has_service("llm", service_name):
-        await hass.services.async_call(
-            domain="llm",
-            service=service_name,
-            service_data={"api": api},
-            blocking=True,
-        )
+    unregister_api = async_register_api(hass, api)
+
+    # Store both components in the hass data registry
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "api": api,
+        "embedding_manager": embedding_manager,
+        "unregister_api": unregister_api,
+    }
 
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    api = hass.data[DOMAIN][entry.entry_id]
-    await api.async_unload()
+    components = hass.data[DOMAIN][entry.entry_id]
 
+    # Unload embedding manager
+    await components["embedding_manager"].async_unload()
+
+    # Unload API
+    await components["api"].async_unload()
+
+    # Unregister API from LLM system
+    components["unregister_api"]()
+
+    # Clean up data
     hass.data[DOMAIN].pop(entry.entry_id)
     if not hass.data[DOMAIN]:
         hass.data.pop(DOMAIN)
-
-    # Unregister the API with Home Assistant's LLM system
-    service_name = "unregister_api"
-    if hass.services.has_service("llm", service_name):
-        await hass.services.async_call(
-            domain="llm",
-            service=service_name,
-            service_data={"api_id": api.id},
-            blocking=True,
-        )
 
     return True
