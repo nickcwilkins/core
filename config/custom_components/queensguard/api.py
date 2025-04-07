@@ -17,7 +17,12 @@ from homeassistant.components.intent import async_device_supports_timers
 from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import intent
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    floor_registry as fr,
+    intent,
+)
 from homeassistant.helpers.llm import (
     API,
     APIInstance,
@@ -27,54 +32,18 @@ from homeassistant.helpers.llm import (
     LLMContext,
     ScriptTool,
     Tool,
-    ToolInput,
     _get_exposed_entities,
 )
-from homeassistant.util.json import JsonObjectType
+from homeassistant.util import yaml as yaml_util
+
+from .embeddings import EmbeddingManager
 
 _LOGGER = logging.getLogger(__name__)
 
 # Intent constant not imported from elsewhere
 INTENT_GET_WEATHER = "GetWeather"
 
-QUEENS_GUARD_API_ID = "queens_guard"
-
-
-class QueensGuardEmbeddingTool(Tool):
-    """Tool to retrieve relevant context from embeddings."""
-
-    name = "retrieve_context"
-    description = "Retrieve relevant context from stored embeddings based on user query"
-
-    def __init__(self, api: QueensGuardAPI) -> None:
-        """Initialize the embedding tool."""
-        self.api = api
-
-    async def async_call(
-        self, hass: HomeAssistant, tool_input: ToolInput, llm_context: LLMContext
-    ) -> JsonObjectType:
-        """Retrieve context from embeddings."""
-        query = llm_context.user_prompt
-        if not query:
-            return {
-                "success": False,
-                "message": "No query provided",
-            }
-
-        try:
-            context_results = await self.api.async_retrieve_relevant_context(query)
-
-        except HomeAssistantError as err:
-            _LOGGER.error("Error retrieving context: %s", err)
-            return {
-                "success": False,
-                "message": f"Error retrieving context: {err}",
-            }
-        else:
-            return {
-                "success": True,
-                "results": context_results,
-            }
+QUEENS_GUARD_API_ID = "queensguard"
 
 
 class QueensGuardAPI(API):
@@ -99,7 +68,7 @@ class QueensGuardAPI(API):
         hass: HomeAssistant,
         chroma_url: str,
         ollama_url: str,
-        embedding_manager=None,
+        embedding_manager: EmbeddingManager = None,
     ) -> None:
         """Initialize the Queen's Guard API."""
         super().__init__(
@@ -119,7 +88,7 @@ class QueensGuardAPI(API):
             _LOGGER.debug(
                 "Getting exposed entities for assistant: %s", llm_context.assistant
             )
-            exposed_entities: dict | None = await self._async_get_api_prompt(
+            exposed_entities: dict | None = await self._async_get_api_prompt_entities(
                 llm_context
             )
         else:
@@ -129,48 +98,120 @@ class QueensGuardAPI(API):
         _LOGGER.debug("Creating API instance with tools")
         return APIInstance(
             api=self,
-            api_prompt=self._get_api_prompt(),
+            api_prompt=self._async_get_api_prompt(llm_context, exposed_entities),
             llm_context=llm_context,
             tools=self._async_get_tools(llm_context, exposed_entities),
+            custom_serializer=None,
         )
 
-    async def _async_get_api_prompt(self, llm_context: LLMContext) -> dict | None:
-        """Get API prompt with relevant context from embeddings if available."""
-        if not llm_context.user_prompt:
-            _LOGGER.debug("No user prompt available for context retrieval")
-            return _get_exposed_entities(
-                self.hass, llm_context.assistant, include_state=False
-            )
-
-        _LOGGER.debug("Fetching relevant context for API prompt")
-        return _get_exposed_entities(
+    async def _async_get_api_prompt_entities(
+        self, llm_context: LLMContext
+    ) -> dict | None:
+        """Get API prompt entities with relevant context from embeddings if available."""
+        base_entities = _get_exposed_entities(
             self.hass, llm_context.assistant, include_state=False
         )
 
+        if not llm_context.user_prompt or not self.embedding_manager:
+            _LOGGER.debug("No user prompt or embedding manager, using default entities")
+            return base_entities
+
+        try:
+            _LOGGER.debug("Retrieving relevant context for user query")
+            context_results = (
+                await self.embedding_manager.async_retrieve_relevant_context(
+                    llm_context.user_prompt
+                )
+            )
+
+            _LOGGER.debug("Retrieved %d context results", len(context_results))
+
+        except Exception as err:
+            _LOGGER.error("Error retrieving context: %s", err)
+            raise
+        else:
+            return base_entities
+
     @callback
-    def _get_api_prompt(self) -> str:
+    def _async_get_api_prompt(
+        self, llm_context: LLMContext, exposed_entities: dict | None
+    ) -> str:
         """Return the prompt for the API."""
-        return (
-            "Queen's Guard provides advanced RAG capabilities to enhance your responses. "
-            "Use the retrieve_context tool to get relevant information from stored embeddings "
-            "when answering user questions about their smart home.\n\n"
-            "The tool will search for context related to any entities mentioned in the "
-            "user's question, their current states, and historical values.\n\n"
-            "When controlling Home Assistant always call the intent tools. "
-            "Use HassTurnOn to lock and HassTurnOff to unlock a lock. "
-            "When controlling a device, prefer passing just name and domain. "
-            "When controlling an area, prefer passing just area name and domain."
+        if not exposed_entities or not exposed_entities["entities"]:
+            return "Only if the user wants to control a device, tell them to expose entities to their voice assistant in Home Assistant."
+
+        return "\n".join(
+            [
+                *self._async_get_preamble(llm_context),
+                *self._async_get_exposed_entities_prompt(llm_context, exposed_entities),
+            ]
         )
+
+    @callback
+    def _async_get_preamble(self, llm_context: LLMContext) -> list[str]:
+        """Return the preamble for the API."""
+        prompt = [
+            (
+                "Queen's Guard provides advanced RAG capabilities to enhance your responses. "
+                "When controlling Home Assistant always call the intent tools. "
+                "Use HassTurnOn to lock and HassTurnOff to unlock a lock. "
+                "When controlling a device, prefer passing just name and domain. "
+                "When controlling an area, prefer passing just area name and domain."
+            )
+        ]
+
+        area: ar.AreaEntry | None = None
+        floor: fr.FloorEntry | None = None
+        if llm_context.device_id:
+            device_reg = dr.async_get(self.hass)
+            device = device_reg.async_get(llm_context.device_id)
+
+            if device:
+                area_reg = ar.async_get(self.hass)
+                if device.area_id and (area := area_reg.async_get_area(device.area_id)):
+                    floor_reg = fr.async_get(self.hass)
+                    if area.floor_id:
+                        floor = floor_reg.async_get_floor(area.floor_id)
+
+            extra = "and all generic commands like 'turn on the lights' should target this area."
+
+        if floor and area:
+            prompt.append(f"You are in area {area.name} (floor {floor.name}) {extra}")
+        elif area:
+            prompt.append(f"You are in area {area.name} {extra}")
+        else:
+            prompt.append(
+                "When a user asks to turn on all devices of a specific type, "
+                "ask user to specify an area, unless there is only one device of that type."
+            )
+
+        if not llm_context.device_id or not async_device_supports_timers(
+            self.hass, llm_context.device_id
+        ):
+            prompt.append("This device is not able to start timers.")
+
+        return prompt
+
+    @callback
+    def _async_get_exposed_entities_prompt(
+        self, llm_context: LLMContext, exposed_entities: dict | None
+    ) -> list[str]:
+        """Return the prompt for the API for exposed entities."""
+        prompt = []
+
+        if exposed_entities and exposed_entities["entities"]:
+            prompt.append(
+                "An overview of the areas and the devices in this smart home:"
+            )
+            prompt.append(yaml_util.dump(list(exposed_entities["entities"].values())))
+
+        return prompt
 
     @callback
     def _async_get_tools(
         self, llm_context: LLMContext, exposed_entities: dict | None
     ) -> list[Tool]:
         """Return a list of LLM tools."""
-        # Start with our unique RAG tool
-        tools: list[Tool] = [QueensGuardEmbeddingTool(self)]
-
-        # Add all the same tools from AssistAPI
         ignore_intents = self.IGNORE_INTENTS
         if not llm_context.device_id or not async_device_supports_timers(
             self.hass, llm_context.device_id
@@ -204,14 +245,10 @@ class QueensGuardAPI(API):
                 or intent_handler.platforms & exposed_domains
             ]
 
-        tools.extend(
-            [
-                IntentTool(
-                    self.cached_slugify(intent_handler.intent_type), intent_handler
-                )
-                for intent_handler in intent_handlers
-            ]
-        )
+        tools: list[Tool] = [
+            IntentTool(self.cached_slugify(intent_handler.intent_type), intent_handler)
+            for intent_handler in intent_handlers
+        ]
 
         if exposed_entities:
             if exposed_entities[CALENDAR_DOMAIN]:
