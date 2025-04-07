@@ -48,14 +48,13 @@ class QueensGuardEmbeddingTool(Tool):
 
     def __init__(self, api: QueensGuardAPI) -> None:
         """Initialize the embedding tool."""
-        super().__init__()
         self.api = api
 
     async def async_call(
         self, hass: HomeAssistant, tool_input: ToolInput, llm_context: LLMContext
     ) -> JsonObjectType:
         """Retrieve context from embeddings."""
-        query = tool_input.tool_args.get("query")
+        query = llm_context.user_prompt
         if not query:
             return {
                 "success": False,
@@ -64,6 +63,7 @@ class QueensGuardEmbeddingTool(Tool):
 
         try:
             context_results = await self.api.async_retrieve_relevant_context(query)
+
         except HomeAssistantError as err:
             _LOGGER.error("Error retrieving context: %s", err)
             return {
@@ -111,21 +111,40 @@ class QueensGuardAPI(API):
         self.chroma_url = chroma_url
         self.ollama_url = ollama_url
         self.cached_slugify = cache(partial(slugify, separator="_", lowercase=False))
+        _LOGGER.info("Initialized Queen's Guard API")
 
     async def async_get_api_instance(self, llm_context: LLMContext) -> APIInstance:
         """Return the instance of the API."""
         if llm_context.assistant:
-            exposed_entities: dict | None = _get_exposed_entities(
-                self.hass, llm_context.assistant, include_state=False
+            _LOGGER.debug(
+                "Getting exposed entities for assistant: %s", llm_context.assistant
+            )
+            exposed_entities: dict | None = await self._async_get_api_prompt(
+                llm_context
             )
         else:
+            _LOGGER.debug("No assistant specified, skipping exposed entities")
             exposed_entities = None
 
+        _LOGGER.debug("Creating API instance with tools")
         return APIInstance(
             api=self,
             api_prompt=self._get_api_prompt(),
             llm_context=llm_context,
             tools=self._async_get_tools(llm_context, exposed_entities),
+        )
+
+    async def _async_get_api_prompt(self, llm_context: LLMContext) -> dict | None:
+        """Get API prompt with relevant context from embeddings if available."""
+        if not llm_context.user_prompt:
+            _LOGGER.debug("No user prompt available for context retrieval")
+            return _get_exposed_entities(
+                self.hass, llm_context.assistant, include_state=False
+            )
+
+        _LOGGER.debug("Fetching relevant context for API prompt")
+        return _get_exposed_entities(
+            self.hass, llm_context.assistant, include_state=False
         )
 
     @callback
@@ -216,8 +235,14 @@ class QueensGuardAPI(API):
         if self.embedding_manager is None:
             raise HomeAssistantError("Embedding manager is not initialized")
 
-        return await self.embedding_manager.async_retrieve_relevant_context(query)
+        _LOGGER.debug("Retrieving relevant context for query: %s", query)
+        try:
+            return await self.embedding_manager.async_retrieve_relevant_context(query)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.error("Error retrieving context: %s", err)
+            raise HomeAssistantError(f"Failed to retrieve context: {err}") from err
 
     async def async_unload(self) -> None:
         """Unload the API and clean up resources."""
-        # Nothing to do here, embedding manager is handled separately
+        _LOGGER.debug("Unloading Queen's Guard API")
+        # Nothing specific to clean up here, embedding manager is handled separately

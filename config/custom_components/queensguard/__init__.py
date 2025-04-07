@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlparse
+
+import chromadb
+from ollama import AsyncClient
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.llm import async_register_api
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.ssl import get_default_context
 
 from .api import QueensGuardAPI
-from .const import CONF_CHROMA_URL, CONF_OLLAMA_URL, DOMAIN
+from .const import CONF_CHROMA_URL, CONF_MODEL, CONF_OLLAMA_URL, DOMAIN
 from .embeddings import EmbeddingManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,13 +26,37 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+def _create_chroma_client(url: str) -> chromadb.HttpClient:
+    """Create ChromaDB client in an executor to avoid blocking I/O in the event loop."""
+    parsed_url = urlparse(url)
+    return chromadb.HttpClient(
+        host=parsed_url.hostname or "localhost",
+        port=parsed_url.port or 8000,
+        ssl=parsed_url.scheme == "https",
+    )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Queen's Guard from a config entry."""
     chroma_url = entry.data.get(CONF_CHROMA_URL)
     ollama_url = entry.data.get(CONF_OLLAMA_URL)
+    model = entry.data.get(CONF_MODEL)
 
-    # Create the embedding manager
-    embedding_manager = EmbeddingManager(hass, chroma_url, ollama_url)
+    _LOGGER.info("Setting up Queen's Guard with model: %s", model)
+
+    # Initialize ChromaDB client in the executor to avoid blocking I/O
+    chroma_client = await hass.async_add_executor_job(_create_chroma_client, chroma_url)
+
+    # Initialize Ollama client
+    ollama_client = AsyncClient(host=ollama_url, verify=get_default_context())
+
+    # Create the embedding manager with the client instances and model
+    embedding_manager = EmbeddingManager(
+        hass=hass,
+        chroma_client=chroma_client,
+        ollama_client=ollama_client,
+        model=model,
+    )
 
     # Set up embedding listeners
     await embedding_manager.async_setup()
@@ -42,6 +71,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "api": api,
         "embedding_manager": embedding_manager,
+        "chroma_client": chroma_client,
+        "ollama_client": ollama_client,
         "unregister_api": unregister_api,
     }
 
