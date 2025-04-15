@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 from urllib.parse import urlparse
 
 import chromadb
+from chromadb.api.async_api import AsyncClientAPI
 from ollama import AsyncClient
 
 from homeassistant.config_entries import ConfigEntry
@@ -26,10 +28,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-def _create_chroma_client(url: str) -> chromadb.HttpClient:
+async def _create_chroma_client(url: str) -> AsyncClientAPI:
     """Create ChromaDB client in an executor to avoid blocking I/O in the event loop."""
     parsed_url = urlparse(url)
-    return chromadb.HttpClient(
+    return await chromadb.AsyncHttpClient(
         host=parsed_url.hostname or "localhost",
         port=parsed_url.port or 8000,
         ssl=parsed_url.scheme == "https",
@@ -38,14 +40,14 @@ def _create_chroma_client(url: str) -> chromadb.HttpClient:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Queen's Guard from a config entry."""
-    chroma_url = entry.data.get(CONF_CHROMA_URL)
-    ollama_url = entry.data.get(CONF_OLLAMA_URL)
-    model = entry.data.get(CONF_MODEL)
+    chroma_url = cast(str, entry.data.get(CONF_CHROMA_URL))
+    ollama_url = cast(str, entry.data.get(CONF_OLLAMA_URL))
+    model = cast(str, entry.data.get(CONF_MODEL))
 
     _LOGGER.info("Setting up Queen's Guard with model: %s", model)
 
     # Initialize ChromaDB client in the executor to avoid blocking I/O
-    chroma_client = await hass.async_add_executor_job(_create_chroma_client, chroma_url)
+    chroma_client = await _create_chroma_client(chroma_url)
 
     # Initialize Ollama client
     ollama_client = AsyncClient(host=ollama_url, verify=get_default_context())

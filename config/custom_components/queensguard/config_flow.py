@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import chromadb
+from chromadb.api import AsyncClientAPI
 import ollama
 from ollama import ResponseError
 import voluptuous as vol
@@ -64,7 +65,7 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         self.model: str | None = None
         self.ollama_client: ollama.AsyncClient | None = None
         self.download_task: asyncio.Task | None = None
-        self.chroma_client: chromadb.Client | None = None
+        self.chroma_client: AsyncClientAPI | None = None
         self.downloaded_models: set[str] = set()
 
     async def async_step_user(
@@ -319,13 +320,11 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             # Parse the url
             parsed_url = urlparse(url)
-            self.chroma_client = chromadb.HttpClient(
+            self.chroma_client = await chromadb.AsyncHttpClient(
                 host=parsed_url.hostname or "localhost",
                 port=parsed_url.port or 8000,
                 ssl=parsed_url.scheme == "https",
             )
-            # Test connection by retrieving heartbeat
-            self.chroma_client.heartbeat()
 
         except TimeoutError:
             _LOGGER.exception("Timeout connecting to ChromaDB at %s", url)
@@ -388,7 +387,8 @@ class QueensGuardOptionsFlowHandler(OptionsFlow):
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow."""
-        self.config_entry = config_entry
+        self.chroma_url: str = config_entry.data[CONF_CHROMA_URL]
+        self.ollama_url: str = config_entry.data[CONF_OLLAMA_URL]
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -401,7 +401,7 @@ class QueensGuardOptionsFlowHandler(OptionsFlow):
     ) -> ConfigFlowResult:
         """Reconfigure the integration."""
         # Start the reconfigure flow by transferring to the ConfigFlow reconfigure step
-        return self.hass.config_entries.flow.async_init(
+        return await self.hass.config_entries.flow.async_init(
             DOMAIN,
             context={
                 "source": SOURCE_RECONFIGURE,

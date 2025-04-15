@@ -15,9 +15,11 @@ Implementation Steps:
         - If an entity is no longer exposed, remove it from chroma.
         - If there is a new entity that doesn't exist in the chromadb, add it.
     - When new entities, floors, or areas are added, add the embeddings for them.
+    - Create a collection specifically for attributes, where the document id is the attribute name and the text is also the attribute name.
 5. Override the _get_api_prompt callback of the llm API instance so that instead of returning all the exposed entities, we fetch relevant embeddings from chromadb instead.
     - Don't return every entity exposed to the voice assistant as context.
     - Only include entities that are relevant to the user query.
+    - Only include attributes of returned entities that are relevant to the user query.
 
 General Guidance:
 This integration only supports a single config entry.
