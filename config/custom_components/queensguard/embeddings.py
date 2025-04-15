@@ -16,14 +16,9 @@ import ollama
 from ollama import EmbeddingsResponse, ResponseError
 
 from homeassistant.components.conversation import DOMAIN as CONVERSATION_DOMAIN
-from homeassistant.components.homeassistant import async_should_expose
-from homeassistant.core import (
-    EVENT_STATE_CHANGED,
-    Event,
-    EventStateChangedData,
-    HomeAssistant,
-    State,
-)
+from homeassistant.components.homeassistant.exposed_entities import async_should_expose
+from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, State
 from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
