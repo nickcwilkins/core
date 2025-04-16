@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import logging
+from typing import Literal, cast
 
 from chromadb import Metadata
 from chromadb.api import AsyncClientAPI
+from chromadb.api.collection_configuration import CreateCollectionConfiguration
 from chromadb.api.models.AsyncCollection import AsyncCollection
 from chromadb.api.types import Embedding, OneOrMany
 from chromadb.errors import ChromaError
 import numpy as np
 import ollama
-from ollama import EmbeddingsResponse, ResponseError
+from ollama import EmbeddingsResponse
 
 from homeassistant.components.conversation import DOMAIN as CONVERSATION_DOMAIN
 from homeassistant.components.homeassistant.exposed_entities import async_should_expose
@@ -43,15 +45,23 @@ _LOGGER = logging.getLogger(__name__)
 ENTITY_COLLECTION_NAME = "home_assistant_entities"
 ATTRIBUTE_COLLECTION_NAME = "home_assistant_attributes"
 
+type EntityMetadataKey = Literal[
+    "entity_id", "last_updated_timestamp", "area_id", "floor_id", "device_id"
+]
+
+type EntityMetadata = Mapping[EntityMetadataKey, str | int | float | bool | None]
+
 
 @dataclass
 class ContextResult:
     """Context result containing which entities and attributes are relevant."""
 
-    entities: list[str]
-    attributes: list[str]
+    entities: dict[str, EntityMetadata]
+    attributes: set[str]
 
-    def __init__(self, entities: list[str], attributes: list[str]) -> None:
+    def __init__(
+        self, entities: dict[str, EntityMetadata], attributes: set[str]
+    ) -> None:
         """Initialize the context result."""
         self.entities = entities
         self.attributes = attributes
@@ -108,12 +118,23 @@ class EmbeddingManager:
         for collection in collections:
             await self.chroma_client.delete_collection(collection.name)
 
+        configuration: CreateCollectionConfiguration = {
+            "hnsw": {
+                "space": "cosine",
+                "max_neighbors": 30,
+                "ef_construction": 200,
+                "ef_search": 200,
+            },
+            "embedding_function": None,
+        }
         self._entity_collection = await self.chroma_client.get_or_create_collection(
-            ENTITY_COLLECTION_NAME
+            ENTITY_COLLECTION_NAME, configuration=configuration
         )
+
         # Check if attribute collection exists, create it if not
         self._attr_collection = await self.chroma_client.get_or_create_collection(
-            ATTRIBUTE_COLLECTION_NAME
+            ATTRIBUTE_COLLECTION_NAME,
+            configuration=configuration,
         )
         _LOGGER.debug("ChromaDB collections set up successfully")
 
@@ -381,6 +402,13 @@ class EmbeddingManager:
         device_entry: dr.DeviceEntry | None = None
 
         if entity_entry:
+            area_id = entity_entry.area_id
+            if (device_id := entity_entry.device_id) is not None:
+                device_entry = dr.async_get(self.hass).async_get(device_id)
+
+            if not area_id and device_entry and device_entry.area_id:
+                area_id = device_entry.area_id
+
             if entity_entry.area_id:
                 area_entry = ar.async_get(self.hass).async_get_area(
                     entity_entry.area_id
@@ -393,51 +421,70 @@ class EmbeddingManager:
 
             if entity_entry.device_id:
                 device_entry = dr.async_get(self.hass).async_get(entity_entry.device_id)
-                if device_entry:
-                    device_name = device_entry.name_by_user or device_entry.name
 
         else:
             _LOGGER.warning("Entity %s not found in registry", entity_id)
             return
 
-        device_name = (
-            device_entry.name_by_user or device_entry.name if device_entry else None
-        )
-        area_name = area_entry.name if area_entry else None
-        floor_name = floor_entry.name if floor_entry else None
+        document_text: str
+        area_name: str | None = None
+        if area_entry:
+            if area_entry.aliases:
+                area_name = f"{area_entry.name}({', '.join(area_entry.aliases)})"
+            else:
+                area_name = area_entry.name
 
-        document_text = (
-            f"Domain: {state.domain}\n"
-            f"Name: {state.name}\n"
-            f"Aliases: {', '.join(entity_entry.aliases)}\n"
-            f"Area Name: {area_name}\n"
-            f"Floor Name: {floor_name}\n"
-            f"Device Name: {device_name}\n"
-            f"State: {state.state}\n"
-            f"Attributes:"
-        )
+        floor_name: str | None = None
+        if floor_entry:
+            if floor_entry.aliases:
+                floor_name = f"{floor_entry.name}({', '.join(floor_entry.aliases)})"
+            else:
+                floor_name = floor_entry.name
 
-        # Track attribute names for later processing
-        for key, value in state.attributes.items():
-            if key not in [
+        entity_text: str
+        if area_name and not floor_name:
+            entity_text = (
+                f"{state.name} is a {state.domain} entity located in {area_name}.\n"
+            )
+        elif area_name and floor_name:
+            entity_text = f"{state.name} is a {state.domain} entity located in {area_name} on {floor_name}.\n"
+        else:
+            entity_text = f"{state.name} is a {state.domain} entity.\n"
+
+        state_text = f"{state.name} is currently {state.state}."
+
+        attribute_text = ""
+
+        filtered_attributes = {
+            key: value
+            for key, value in state.attributes.items()
+            if key
+            not in [
                 "supported_features",
                 "friendly_name",
                 "entity_id",
                 "icon",
                 "name",
-            ]:
-                attr_values = self._tracked_attributes.setdefault(key, set())
-                document_text += f"\n  {key}: {value}"
+            ]
+        }
 
+        if filtered_attributes:
+            attribute_text = f"{state.name} has the following attributes:\n"
+            for key, value in filtered_attributes.items():
+                if isinstance(value, (str, int, float, bool)):
+                    attribute_text += f"  {key}: {value}\n"
+
+                attr_values = self._tracked_attributes.setdefault(key, set())
                 if len(attr_values) < 5 or key in ["device_class"]:
                     if isinstance(value, (str, int, float, bool)):
                         attr_values.add(value)
 
         # Generate embedding using Ollama
-        embedding_prompt = (
-            f"Represent this Home Assistant entity for searching: {document_text}"
-        )
-        embedding = await self._generate_embedding(embedding_prompt)
+        document_text = f"{entity_text}{state_text}"
+        if attribute_text:
+            document_text += f"\n{attribute_text}"
+
+        embedding = await self._generate_embedding(document_text)
         if embedding is None:
             return
 
@@ -452,8 +499,7 @@ class EmbeddingManager:
         if device_entry:
             metadata["device_id"] = device_entry.id
 
-        await self._add_to_collection(
-            self._entity_collection,
+        await self._entity_collection.upsert(
             [entity_id],
             np.array(embedding, dtype=np.float32),
             metadata,
@@ -497,8 +543,7 @@ class EmbeddingManager:
                 continue
 
             attr_doc_id = f"{attribute_name}"
-            await self._add_to_collection(
-                self._attr_collection,
+            await self._attr_collection.upsert(
                 [attr_doc_id],
                 np.array(embedding, dtype=np.float32),
                 {"attribute_name": attribute_name},
@@ -520,75 +565,37 @@ class EmbeddingManager:
             _LOGGER.error("ChromaDB collections not initialized")
             return None
 
-        entities: list[str] = []
-        attributes: list[str] = []
-
-        try:
-            embedding_text = f"Represent this user query for finding relevant Home Assistant entities: {query}"
-            embedding = await self._generate_embedding(embedding_text)
-            if not embedding:
-                return None
-            total_entities = await self._entity_collection.count()
-            total_attributes = await self._attr_collection.count()
-            entity_results = await self._entity_collection.query(
-                np.array(embedding, dtype=np.float32), n_results=max(1, total_entities)
-            )
-            attr_results = await self._attr_collection.query(
-                np.array(embedding, dtype=np.float32),
-                n_results=max(1, total_attributes),
-            )
-
-            processed_results = []
-
-            # Process entity results
-            documents = entity_results.get("documents")
-            metadata = entity_results.get("metadatas")
-            distances = entity_results.get("distances")
-            if documents and distances and metadata:
-                for i, _doc in enumerate(documents[0]):
-                    metadata = metadata[0][i]
-                    distance = distances[0][i]
-                _LOGGER.debug(
-                    "Retrieved %s relevant entity context items for query",
-                    len(processed_results),
-                )
-            else:
-                _LOGGER.debug("No relevant entity context found for query")
-
-            # Process attribute results
-            attr_documents = attr_results.get("documents")
-            attr_metadata = attr_results.get("metadatas")
-            attr_distances = attr_results.get("distances")
-            if attr_documents and attr_distances and attr_metadata:
-                for i, doc in enumerate(attr_documents[0]):
-                    metadata = attr_metadata[0][i]
-                    distance = attr_distances[0][i]
-
-                    processed_results.append(
-                        {
-                            "document": doc,
-                            "entity_id": metadata.get("entity_id"),
-                            "attribute": metadata.get("attribute"),
-                            "relevance_score": 1.0
-                            - float(distance),  # Convert distance to relevance score
-                        }
-                    )
-
-                _LOGGER.debug(
-                    "Retrieved %s relevant attribute context items for query",
-                    len(processed_results),
-                )
-            else:
-                _LOGGER.debug("No relevant attribute context found for query")
-
-        except (ChromaError, ResponseError, ConnectionError) as err:
-            _LOGGER.error("Error retrieving context: %s", err)
+        embedding = await self._generate_embedding(query)
+        if not embedding:
             return None
-        else:
-            return ContextResult(
-                entities=entities,
-                attributes=attributes,
-            )
+        entity_results = await self._entity_collection.query(
+            np.array(embedding, dtype=np.float32),
+            include=["metadatas", "distances", "documents"],
+        )
+        _LOGGER.debug("Found %s relevant entities", len(entity_results["ids"][0]))
+        attr_results = await self._attr_collection.query(
+            np.array(embedding, dtype=np.float32), include=[]
+        )
+        _LOGGER.debug("Found %s relevant attributes", len(attr_results["ids"][0]))
+
+        # Process entity results
+        if not entity_results["metadatas"]:
+            _LOGGER.error("Entity results contained no metadata")
+            return None
+
+        entities: dict[str, EntityMetadata] = cast(
+            dict[str, EntityMetadata],
+            dict(
+                zip(
+                    entity_results["ids"][0],
+                    entity_results["metadatas"][0],
+                    strict=False,
+                )
+            ),
+        )
+        attributes = set(attr_results["ids"][0])
+
+        return ContextResult(entities, attributes)
 
     async def async_unload(self) -> None:
         """Unload the embedding manager and clean up resources."""

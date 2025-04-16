@@ -4,15 +4,11 @@ from __future__ import annotations
 
 from functools import cache, partial
 import logging
-from typing import Any
 
 from slugify import slugify
 
 from homeassistant.components.calendar import DOMAIN as CALENDAR_DOMAIN
-from homeassistant.components.cover import (
-    SERVICE_CLOSE_COVER as INTENT_CLOSE_COVER,
-    SERVICE_OPEN_COVER as INTENT_OPEN_COVER,
-)
+from homeassistant.components.cover import INTENT_CLOSE_COVER, INTENT_OPEN_COVER
 from homeassistant.components.intent import async_device_supports_timers
 from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN
 from homeassistant.core import HomeAssistant, callback
@@ -116,21 +112,34 @@ class QueensGuardAPI(API):
             _LOGGER.debug("No user prompt or embedding manager, using default entities")
             return base_entities
 
-        try:
-            _LOGGER.debug("Retrieving relevant context for user query")
-            context_results = (
-                await self.embedding_manager.async_retrieve_relevant_context(
-                    llm_context.user_prompt
-                )
-            )
+        _LOGGER.debug("Retrieving relevant context for user query")
+        context_result = await self.embedding_manager.async_retrieve_relevant_context(
+            llm_context.user_prompt
+        )
+        if not context_result or not context_result.entities:
+            _LOGGER.debug("No relevant entities found, using default entities")
+            return {"entities": {}}
 
-            _LOGGER.debug("Retrieved %d context results", len(context_results))
-
-        except Exception as err:
-            _LOGGER.error("Error retrieving context: %s", err)
-            raise
-        else:
-            return base_entities
+        # Filter base_entities to only include relevant entity_ids
+        filtered_entities = {
+            eid: info
+            for eid, info in base_entities["entities"].items()
+            if eid in context_result.entities
+        }
+        # Filter attributes for each entity
+        for info in filtered_entities.values():
+            if "attributes" in info:
+                info["attributes"] = {
+                    k: v
+                    for k, v in info["attributes"].items()
+                    if k in context_result.attributes
+                }
+        # Copy over calendar and script domains if present
+        return {
+            "entities": filtered_entities,
+            CALENDAR_DOMAIN: base_entities.get(CALENDAR_DOMAIN, {}),
+            SCRIPT_DOMAIN: base_entities.get(SCRIPT_DOMAIN, {}),
+        }
 
     @callback
     def _async_get_api_prompt(
@@ -139,7 +148,6 @@ class QueensGuardAPI(API):
         """Return the prompt for the API."""
         if not exposed_entities or not exposed_entities["entities"]:
             return "Only if the user wants to control a device, tell them to expose entities to their voice assistant in Home Assistant."
-
         return "\n".join(
             [
                 *self._async_get_preamble(llm_context),
@@ -152,7 +160,6 @@ class QueensGuardAPI(API):
         """Return the preamble for the API."""
         prompt = [
             (
-                "Queen's Guard provides advanced RAG capabilities to enhance your responses. "
                 "When controlling Home Assistant always call the intent tools. "
                 "Use HassTurnOn to lock and HassTurnOff to unlock a lock. "
                 "When controlling a device, prefer passing just name and domain. "
@@ -162,6 +169,7 @@ class QueensGuardAPI(API):
 
         area: ar.AreaEntry | None = None
         floor: fr.FloorEntry | None = None
+        extra = ""
         if llm_context.device_id:
             device_reg = dr.async_get(self.hass)
             device = device_reg.async_get(llm_context.device_id)
@@ -267,17 +275,30 @@ class QueensGuardAPI(API):
 
         return tools
 
-    async def async_retrieve_relevant_context(self, query: str) -> list[dict[str, Any]]:
+    async def async_retrieve_relevant_context(self, query: str):
         """Retrieve relevant context based on user query."""
         if self.embedding_manager is None:
             raise HomeAssistantError("Embedding manager is not initialized")
 
         _LOGGER.debug("Retrieving relevant context for query: %s", query)
-        try:
-            return await self.embedding_manager.async_retrieve_relevant_context(query)
-        except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.error("Error retrieving context: %s", err)
-            raise HomeAssistantError(f"Failed to retrieve context: {err}") from err
+
+        embedding_context = (
+            await self.embedding_manager.async_retrieve_relevant_context(query)
+        )
+        if not embedding_context:
+            _LOGGER.debug("No relevant context found for query: %s", query)
+            return []
+
+        # areas = []
+        # floors = []
+        # entities = []
+        # result: dict[str, dict[str, Any]] = {}
+
+        # entity_registry = er.async_get(self.hass)
+        # area_registry = ar.async_get(self.hass)
+        # floor_registry = fr.async_get(self.hass)
+
+        return None
 
     async def async_unload(self) -> None:
         """Unload the API and clean up resources."""
