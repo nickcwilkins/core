@@ -1,42 +1,69 @@
 {
-    "config": {
-        "step": {
-            "user": {
-                "title": "Queen's Guard",
-                "description": "Set up Queen's Guard with RAG support for Voice Assistants",
-                "data": {
-                    "name": "Name",
-                    "chroma_url": "ChromaDB URL (e.g., http://localhost:8000)",
-                    "ollama_url": "Ollama URL (e.g., http://localhost:11434)"
-                }
-            }
-        },
-        "error": {
-            "cannot_connect": "Failed to connect to service",
-            "invalid_response": "Received invalid response from service",
-            "timeout": "Connection timed out",
-            "unknown": "Unexpected error occurred"
-        },
-        "abort": {
-            "already_configured": "Service is already configured"
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Weaviate and Ollama",
+        "description": "Enter the connection details for your Weaviate vector database and Ollama instance.\n\nWeaviate URL: [Documentation]({weaviate_url_docs_link})\nOllama URL: [Documentation]({ollama_url_docs_link})",
+        "data": {
+          "weaviate_url": "Weaviate URL",
+          "weaviate_api_key": "Weaviate API Key (Optional)",
+          "ollama_url": "Ollama URL"
         }
+      },
+      "select_model": {
+        "title": "Select Embedding Model",
+        "description": "Choose the embedding model to use for generating vector embeddings. Models marked as '(downloaded)' are already available on your Ollama server. Selecting a model not yet downloaded will trigger a download.",
+        "data": {
+          "embedding_model": "Embedding Model"
+        }
+      },
+      "download": {
+        "title": "Downloading Model: {embedding_model}",
+        "description": "Please wait while the selected embedding model is downloaded by the Ollama server. This may take several minutes depending on the model size and your internet connection."
+      }
     },
-    "options": {
-        "step": {
-            "init": {
-                "title": "Queen's Guard Options",
-                "description": "Update Queen's Guard connection settings",
-                "data": {
-                    "chroma_url": "ChromaDB URL",
-                    "ollama_url": "Ollama URL"
-                }
-            }
-        },
-        "error": {
-            "cannot_connect": "Failed to connect to service",
-            "invalid_response": "Received invalid response from service",
-            "timeout": "Connection timed out",
-            "unknown": "Unexpected error occurred"
-        }
+    "error": {
+      "cannot_connect": "Failed to connect to Weaviate or Ollama. Please check the URL and ensure the service is running.",
+      "invalid_auth": "Invalid Weaviate API key.",
+      "invalid_url": "Invalid Weaviate URL format.",
+      "timeout": "Timeout connecting to Ollama.",
+      "connection_error": "Error connecting to Ollama.",
+      "invalid_response": "Ollama API returned an invalid response.",
+      "unknown": "An unknown error occurred."
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single instance of Queen's Guard is allowed.",
+      "download_failed": "Failed to download the selected embedding model from Ollama. Please check the Ollama server logs for more details."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Queen's Guard Options",
+        "description": "Options are managed via the reconfigure flow."
+      },
+      "reconfigure": {
+        "title": "Reconfigure Queen's Guard",
+        "description": "Update the connection details or embedding model for Queen's Guard.\n\nWeaviate URL: [Documentation]({weaviate_url_docs_link})\nOllama URL: [Documentation]({ollama_url_docs_link})",
+        "data": {
+          "weaviate_url": "Weaviate URL",
+          "weaviate_api_key": "Weaviate API Key (Optional)",
+          "ollama_url": "Ollama URL",
+          "embedding_model": "Embedding Model"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Weaviate or Ollama. Please check the URL and ensure the service is running.",
+      "invalid_auth": "Invalid Weaviate API key.",
+      "invalid_url": "Invalid Weaviate URL format.",
+      "timeout": "Timeout connecting to Ollama.",
+      "connection_error": "Error connecting to Ollama.",
+      "invalid_response": "Ollama API returned an invalid response.",
+      "unknown": "An unknown error occurred."
+    },
+    "abort": {
+      "download_failed": "Failed to download the selected embedding model from Ollama. Please check the Ollama server logs for more details."
+    }
+  }
 }

@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 from typing import Any
-from urllib.parse import urlparse
 
-import chromadb
-from chromadb.api import AsyncClientAPI
 import ollama
 from ollama import ResponseError
 import voluptuous as vol
+import weaviate
 
 from homeassistant.config_entries import (
     SOURCE_RECONFIGURE,
@@ -29,20 +28,31 @@ from homeassistant.helpers.selector import (
     TextSelectorConfig,
     TextSelectorType,
 )
-from homeassistant.util.ssl import get_default_context
 
 from .const import (
-    CONF_CHROMA_URL,
-    CONF_MODEL,
+    CONF_EMBEDDING_MODEL,
     CONF_OLLAMA_URL,
-    DEFAULT_MODEL,
+    CONF_WEAVIATE_API_KEY,
+    CONF_WEAVIATE_URL,
+    DEFAULT_EMBEDDING_MODEL,
     DEFAULT_NAME,
     DEFAULT_TIMEOUT,
     DOMAIN,
     EMBEDDING_MODELS,
 )
+from .memories import MemoryManager
+from .util import create_ollama_client, create_weaviate_client
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class QueensGuardData:
+    """Data for QueensGuard integration."""
+
+    ollama: ollama.AsyncClient
+    weaviate: weaviate.WeaviateClient
+    memory_manager: MemoryManager
 
 
 class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -56,16 +66,17 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         config_entry: ConfigEntry,
     ) -> QueensGuardOptionsFlowHandler:
         """Get the options flow for this handler."""
-        return QueensGuardOptionsFlowHandler(config_entry)
+        return QueensGuardOptionsFlowHandler()
 
     def __init__(self) -> None:
         """Initialize config flow."""
-        self.chroma_url: str | None = None
+        self.weaviate_url: str | None = None
+        self.weaviate_api_key: str | None = None
         self.ollama_url: str | None = None
-        self.model: str | None = None
+        self.embedding_model: str | None = None
         self.ollama_client: ollama.AsyncClient | None = None
         self.download_task: asyncio.Task | None = None
-        self.chroma_client: AsyncClientAPI | None = None
+        self.weaviate_client: weaviate.WeaviateClient | None = None
         self.downloaded_models: set[str] = set()
 
     async def async_step_user(
@@ -75,21 +86,22 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            self.chroma_url = user_input.get(CONF_CHROMA_URL, self.chroma_url)
+            self.weaviate_url = user_input.get(CONF_WEAVIATE_URL, self.weaviate_url)
+            self.weaviate_api_key = user_input.get(CONF_WEAVIATE_API_KEY)
             self.ollama_url = user_input.get(CONF_OLLAMA_URL, self.ollama_url)
-            self.model = user_input.get(CONF_MODEL, self.model)
+            self.embedding_model = user_input.get(
+                CONF_EMBEDDING_MODEL, self.embedding_model
+            )
 
             # If we have URLs but no model yet, proceed to connection testing
-            if self.chroma_url and self.ollama_url and not self.model:
-                # Check if this combination of URLs is already configured
-                await self.async_set_unique_id(f"{self.chroma_url}_{self.ollama_url}")
-                self._abort_if_unique_id_configured()
-
-                _LOGGER.debug("Testing connection to ChromaDB at %s", self.chroma_url)
+            if self.weaviate_url and self.ollama_url and not self.embedding_model:
+                _LOGGER.debug("Testing connection to Weaviate at %s", self.weaviate_url)
                 # Test connections to both services
-                chroma_error = await self._test_chroma_connection(self.chroma_url)
-                if chroma_error:
-                    errors[CONF_CHROMA_URL] = chroma_error
+                weaviate_error = await self._test_weaviate_connection(
+                    self.weaviate_url, self.weaviate_api_key
+                )
+                if weaviate_error:
+                    errors["base"] = weaviate_error  # Use 'base' for general errors
 
                 _LOGGER.debug("Testing connection to Ollama at %s", self.ollama_url)
                 ollama_error, models = await self._test_ollama_connection(
@@ -101,18 +113,19 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
                     self.downloaded_models = models
 
                 if not errors:
-                    _LOGGER.debug("Successfully connected to ChromaDB and Ollama")
+                    _LOGGER.debug("Successfully connected to Weaviate and Ollama")
                     # Proceed to model selection
                     return await self.async_step_select_model()
 
             # If we have all info, create the entry
-            elif self.chroma_url and self.ollama_url and self.model:
+            elif self.weaviate_url and self.ollama_url and self.embedding_model:
                 return self.async_create_entry(
                     title=DEFAULT_NAME,
                     data={
-                        CONF_CHROMA_URL: self.chroma_url,
+                        CONF_WEAVIATE_URL: self.weaviate_url,
+                        CONF_WEAVIATE_API_KEY: self.weaviate_api_key,
                         CONF_OLLAMA_URL: self.ollama_url,
-                        CONF_MODEL: self.model,
+                        CONF_EMBEDDING_MODEL: self.embedding_model,
                     },
                 )
 
@@ -120,30 +133,28 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Required(
-                    CONF_CHROMA_URL,
-                    default=self.chroma_url if self.chroma_url else None,
+                    CONF_WEAVIATE_URL,
+                    default=self.weaviate_url if self.weaviate_url else None,
                 ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
+                # vol.Optional(CONF_WEAVIATE_API_KEY): TextSelector(
+                #     TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                # ),
                 vol.Required(
                     CONF_OLLAMA_URL,
                     default=self.ollama_url if self.ollama_url else None,
                 ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
             }
         )
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=schema,
-            errors=errors,
-        )
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
     async def async_step_select_model(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Select the embedding model to use."""
         if user_input is not None:
-            self.model = user_input[CONF_MODEL]
+            self.embedding_model = user_input[CONF_EMBEDDING_MODEL]
 
-            if self.model not in self.downloaded_models:
+            if self.embedding_model not in self.downloaded_models:
                 # Ollama server needs to download model first
                 return await self.async_step_download()
 
@@ -151,9 +162,10 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(
                 title=DEFAULT_NAME,
                 data={
-                    CONF_CHROMA_URL: self.chroma_url,
+                    CONF_WEAVIATE_URL: self.weaviate_url,
+                    CONF_WEAVIATE_API_KEY: self.weaviate_api_key,
                     CONF_OLLAMA_URL: self.ollama_url,
-                    CONF_MODEL: self.model,
+                    CONF_EMBEDDING_MODEL: self.embedding_model,
                 },
             )
 
@@ -171,10 +183,10 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         model_step_schema = vol.Schema(
             {
                 vol.Required(
-                    CONF_MODEL,
-                    default=DEFAULT_MODEL
-                    if DEFAULT_MODEL in self.downloaded_models
-                    else f"{DEFAULT_MODEL}:latest",
+                    CONF_EMBEDDING_MODEL,
+                    default=DEFAULT_EMBEDDING_MODEL
+                    if DEFAULT_EMBEDDING_MODEL in self.downloaded_models
+                    else f"{DEFAULT_EMBEDDING_MODEL}:latest",
                 ): SelectSelector(
                     SelectSelectorConfig(options=models_to_list, custom_value=True)
                 ),
@@ -190,44 +202,42 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Step to wait for Ollama server to download a model."""
-        assert self.model is not None
+        assert self.embedding_model is not None
         assert self.ollama_client is not None
 
         if self.download_task is None:
             # Tell Ollama server to pull the model.
             # The task will block until the model and metadata are fully downloaded.
             self.download_task = self.hass.async_create_background_task(
-                self.ollama_client.pull(self.model),
-                f"Downloading {self.model}",
+                self.ollama_client.pull(self.embedding_model),
+                f"Downloading {self.embedding_model}",
             )
 
-        if self.download_task.done():
-            if err := self.download_task.exception():
-                _LOGGER.exception("Unexpected error while downloading model: %s", err)
-                return self.async_show_progress_done(next_step_id="failed")
+        try:
+            await self.download_task
+        except Exception:
+            _LOGGER.exception("Unexpected error while downloading model")
+            return self.async_show_progress_done(next_step_id="failed")
+        finally:
+            self.download_task = None
 
-            return self.async_show_progress_done(next_step_id="finish")
-
-        return self.async_show_progress(
-            step_id="download",
-            progress_action="download",
-            progress_task=self.download_task,
-        )
+        return self.async_show_progress_done(next_step_id="finish")
 
     async def async_step_finish(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Step after model downloading has succeeded."""
-        assert self.chroma_url is not None
+        assert self.weaviate_url is not None
         assert self.ollama_url is not None
-        assert self.model is not None
+        assert self.embedding_model is not None
 
         return self.async_create_entry(
             title=DEFAULT_NAME,
             data={
-                CONF_CHROMA_URL: self.chroma_url,
+                CONF_WEAVIATE_URL: self.weaviate_url,
+                CONF_WEAVIATE_API_KEY: self.weaviate_api_key,
                 CONF_OLLAMA_URL: self.ollama_url,
-                CONF_MODEL: self.model,
+                CONF_EMBEDDING_MODEL: self.embedding_model,
             },
         )
 
@@ -242,67 +252,68 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Reconfigure connection settings."""
         errors: dict[str, str] = {}
-        entry = self._get_reconfigure_entry()
+        entry = self.current_entry
+        assert entry  # Should exist for reconfigure
 
         if user_input is not None:
-            chroma_url = user_input[CONF_CHROMA_URL]
+            weaviate_url = user_input[CONF_WEAVIATE_URL]
+            weaviate_api_key = user_input.get(CONF_WEAVIATE_API_KEY)
             ollama_url = user_input[CONF_OLLAMA_URL]
-            model = user_input.get(
-                CONF_MODEL, entry.data.get(CONF_MODEL, DEFAULT_MODEL)
+            embedding_model = user_input.get(
+                CONF_EMBEDDING_MODEL,
+                entry.data.get(CONF_EMBEDDING_MODEL, DEFAULT_EMBEDDING_MODEL),
             )
 
-            # Check if this combination of URLs is already configured in another entry
-            new_unique_id = f"{chroma_url}_{ollama_url}"
-            await self.async_set_unique_id(new_unique_id)
-            self._abort_if_unique_id_mismatch()
-
             # Test connections to both services
-            chroma_error = await self._test_chroma_connection(chroma_url)
-            if chroma_error:
-                errors[CONF_CHROMA_URL] = chroma_error
+            weaviate_error = await self._test_weaviate_connection(
+                weaviate_url, weaviate_api_key
+            )
+            if weaviate_error:
+                errors["base"] = weaviate_error
 
             ollama_error, models = await self._test_ollama_connection(ollama_url)
             if ollama_error:
                 errors[CONF_OLLAMA_URL] = ollama_error
 
             # Ensure the model is available or can be downloaded
-            if not ollama_error and model not in models:
+            if not ollama_error and embedding_model not in models:
                 # We'll need to download - but that happens in a separate step
-                self.chroma_url = chroma_url
+                self.weaviate_url = weaviate_url
+                self.weaviate_api_key = weaviate_api_key
                 self.ollama_url = ollama_url
-                self.model = model
-                self.ollama_client = ollama.AsyncClient(
-                    host=ollama_url, verify=get_default_context()
-                )
+                self.embedding_model = embedding_model
                 return await self.async_step_download()
 
             if not errors:
-                _LOGGER.debug("Successfully connected to ChromaDB and Ollama")
+                _LOGGER.debug("Successfully connected to Weaviate and Ollama")
                 data = {
-                    CONF_CHROMA_URL: chroma_url,
+                    CONF_WEAVIATE_URL: weaviate_url,
+                    CONF_WEAVIATE_API_KEY: weaviate_api_key,
                     CONF_OLLAMA_URL: ollama_url,
-                    CONF_MODEL: model,
+                    CONF_EMBEDDING_MODEL: embedding_model,
                 }
-                return self.async_update_reload_and_abort(
-                    entry, data=data, unique_id=new_unique_id
-                )
+                return self.async_update_reload_and_abort(entry, data=data)
 
         # Get current values from entry
-        chroma_url = entry.data.get(CONF_CHROMA_URL, "")
+        weaviate_url = entry.data.get(CONF_WEAVIATE_URL, "")
+        weaviate_api_key = entry.data.get(CONF_WEAVIATE_API_KEY)
         ollama_url = entry.data.get(CONF_OLLAMA_URL, "")
-        model = entry.data.get(CONF_MODEL, DEFAULT_MODEL)
+        embedding_model = entry.data.get(CONF_EMBEDDING_MODEL, DEFAULT_EMBEDDING_MODEL)
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_CHROMA_URL, default=chroma_url): TextSelector(
+                vol.Required(CONF_WEAVIATE_URL, default=weaviate_url): TextSelector(
                     TextSelectorConfig(type=TextSelectorType.URL)
                 ),
+                vol.Optional(
+                    CONF_WEAVIATE_API_KEY, default=weaviate_api_key
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
                 vol.Required(CONF_OLLAMA_URL, default=ollama_url): TextSelector(
                     TextSelectorConfig(type=TextSelectorType.URL)
                 ),
-                vol.Required(CONF_MODEL, default=model): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.TEXT)
-                ),
+                vol.Required(
+                    CONF_EMBEDDING_MODEL, default=embedding_model
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
             }
         )
 
@@ -312,28 +323,28 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def _test_chroma_connection(self, url: str) -> str | None:
-        """Test connection to ChromaDB.
+    async def _test_weaviate_connection(
+        self, url: str, api_key: str | None
+    ) -> str | None:
+        """Test connection to Weaviate.
 
         Returns None if connection successful, error code string otherwise.
         """
-        try:
-            # Parse the url
-            parsed_url = urlparse(url)
-            self.chroma_client = await chromadb.AsyncHttpClient(
-                host=parsed_url.hostname or "localhost",
-                port=parsed_url.port or 8000,
-                ssl=parsed_url.scheme == "https",
-            )
 
-        except TimeoutError:
-            _LOGGER.exception("Timeout connecting to ChromaDB at %s", url)
-            return "timeout"
+        try:
+            client = await create_weaviate_client(url, api_key)
+            # Test connection by checking readiness
+            if not await client.is_ready():
+                _LOGGER.error("Weaviate instance at %s is not ready", url)
+                await client.close()
+                return "cannot_connect"
+            await client.close()
+
         except ValueError:
-            _LOGGER.exception("Invalid URL format for ChromaDB at %s", url)
+            _LOGGER.exception("Invalid URL format for Weaviate at %s", url)
             return "invalid_url"
         except Exception:
-            _LOGGER.exception("Unexpected exception connecting to ChromaDB at %s", url)
+            _LOGGER.exception("Unexpected exception connecting to Weaviate at %s", url)
             return "unknown"
         else:
             return None
@@ -348,9 +359,7 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
 
         try:
             # Create ollama client with the provided URL
-            self.ollama_client = ollama.AsyncClient(
-                host=url, verify=get_default_context()
-            )
+            self.ollama_client = await create_ollama_client(url)
 
             # Test the connection by listing available models
             async with asyncio.timeout(DEFAULT_TIMEOUT):
@@ -375,9 +384,6 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         except ConnectionError as err:
             _LOGGER.error("Ollama connection error: %s", err)
             return "connection_error", downloaded_models
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Unexpected exception connecting to Ollama at %s", url)
-            return "unknown", downloaded_models
         else:
             return None, downloaded_models
 
@@ -385,15 +391,11 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
 class QueensGuardOptionsFlowHandler(OptionsFlow):
     """Handle Queen's Guard options."""
 
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        """Initialize options flow."""
-        self.chroma_url: str = config_entry.data[CONF_CHROMA_URL]
-        self.ollama_url: str = config_entry.data[CONF_OLLAMA_URL]
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage the options."""
+        # Options flow should redirect to reconfigure to allow changing URLs/API key
         return await self.async_step_reconfigure()
 
     async def async_step_reconfigure(
