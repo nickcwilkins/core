@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.llm import LLMContext, Tool, ToolInput
 from homeassistant.util.json import JsonObjectType
 
-from .memories import MemoryManager
+from .service import MemoryManager
 
 
 class AddMemoryTool(Tool):

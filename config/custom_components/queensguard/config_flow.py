@@ -40,7 +40,7 @@ from .const import (
     DOMAIN,
     EMBEDDING_MODELS,
 )
-from .memories import MemoryManager
+from .memory.service import MemoryManager
 from .util import create_ollama_client, create_weaviate_client
 
 _LOGGER = logging.getLogger(__name__)

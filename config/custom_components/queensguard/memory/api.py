@@ -7,7 +7,7 @@ import logging
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.llm import API, APIInstance, LLMContext, Tool
 
-from .memories import Memory, MemoryManager
+from .service import Memory, MemoryManager
 
 # Import the new tool classes
 from .tools import AddMemoryTool, RemoveMemoryTool, UpdateMemoryTool
@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 QUEENS_GUARD_API_ID = "queensguard"
 
 
-class QueensGuardAPI(API):
+class MemoryAPI(API):
     """API exposing Queen's Guard RAG capabilities to LLMs."""
 
     def __init__(self, hass: HomeAssistant, memory_manager: MemoryManager) -> None:

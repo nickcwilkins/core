@@ -14,7 +14,6 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.llm import async_register_api
 from homeassistant.helpers.typing import ConfigType
 
-from .api import QueensGuardAPI
 from .const import (
     CONF_EMBEDDING_MODEL,
     CONF_OLLAMA_URL,
@@ -22,7 +21,8 @@ from .const import (
     CONF_WEAVIATE_URL,
     DOMAIN,
 )
-from .memories import MemoryManager
+from .memory.api import MemoryAPI
+from .memory.service import MemoryManager
 from .util import create_ollama_client, create_weaviate_client
 
 _LOGGER = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(f"Failed to setup Memory Manager: {err}") from err
 
     # Create the API instance with a reference to the memory manager
-    api = QueensGuardAPI(hass, memory_manager)
+    api = MemoryAPI(hass, memory_manager)
 
     # Register the API with Home Assistant's LLM system
     unregister_api = async_register_api(hass, api)
