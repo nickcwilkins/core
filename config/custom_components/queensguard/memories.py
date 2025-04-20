@@ -10,7 +10,7 @@ import uuid
 
 import ollama
 import weaviate
-import weaviate.classes as wvc  # Use v4 imports
+import weaviate.classes as wvc
 
 from homeassistant.core import HomeAssistant
 
@@ -24,7 +24,8 @@ class Memory(TypedDict):
 
     id: str
     memory_text: str
-    date: datetime.datetime
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
     relevance: float
 
 
@@ -113,7 +114,6 @@ class MemoryManager:
         _LOGGER.debug("Adding new memory: %s", memory_text[:100])
 
         embedding = await self._generate_embedding(memory_text)
-
         memory_uuid = uuid.uuid4()
 
         await self._memory_collection.data.insert(
@@ -152,8 +152,7 @@ class MemoryManager:
 
         new_embedding = await self._generate_embedding(new_memory_text)
 
-        # Update using v4 API (replace operation)
-        self._memory_collection.data.update(
+        await self._memory_collection.data.update(
             uuid=memory_id,
             properties={"memory_text": new_memory_text},
             vector=new_embedding,
@@ -170,7 +169,7 @@ class MemoryManager:
             limit: The maximum number of memories to retrieve.
 
         Returns:
-            A list of relevant memory text strings, or an empty list if none found or embedding failed.
+            A list of relevant Memory objects, or an empty list if none found or embedding failed.
 
         """
         assert self._memory_collection is not None
@@ -181,15 +180,42 @@ class MemoryManager:
         response = await self._memory_collection.query.near_vector(
             near_vector=query_embedding,
             limit=limit,
-            return_metadata=wvc.query.MetadataQuery(distance=True),
+            return_metadata=wvc.query.MetadataQuery(
+                distance=True,
+                creation_time=True,
+                last_update_time=True,
+            ),
             return_properties=["memory_text"],
         )
 
-        memories = [
-            obj.properties["memory_text"]
-            for obj in response.objects
-            if isinstance(obj.properties["memory_text"], str)
-        ]
+        memories: list[Memory] = []
+        for obj in response.objects:
+            try:
+                memory_id = str(obj.uuid)
+                memory_text = obj.properties.get("memory_text", "")
+                creation_time = obj.metadata.creation_time
+                last_update_time = obj.metadata.last_update_time
+                relevance = (
+                    1.0 - obj.metadata.distance
+                    if obj.metadata and obj.metadata.distance is not None
+                    else 0.0
+                )
+
+                if not memory_text:
+                    _LOGGER.warning("Memory text is empty for UUID: %s", memory_id)
+                    continue
+
+                memories.append(
+                    {
+                        "id": memory_id,
+                        "memory_text": memory_text,
+                        "created_at": creation_time,
+                        "updated_at": last_update_time,
+                        "relevance": relevance,
+                    }
+                )
+            except (ValueError, AttributeError, KeyError) as err:
+                _LOGGER.warning("Failed to parse memory object: %s", err)
         _LOGGER.debug(
             "Retrieved %d memories, distances: %s",
             len(memories),
