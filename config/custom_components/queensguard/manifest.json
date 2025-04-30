@@ -9,7 +9,11 @@
   "integration_type": "service",
   "iot_class": "local_polling",
   "quality_scale": "bronze",
-  "requirements": ["weaviate-client==4.13.2", "ollama==0.4.7"],
+  "requirements": [
+    "weaviate-client==4.13.2",
+    "ollama==0.4.7",
+    "googlemaps==4.10.0"
+  ],
   "single_config_entry": true,
   "dependencies": ["http"],
   "loggers": ["weaviate", "ollama"]

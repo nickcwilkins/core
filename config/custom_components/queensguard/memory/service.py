@@ -14,8 +14,7 @@ import weaviate.classes as wvc
 
 from homeassistant.core import HomeAssistant
 
-# pylint: disable=hass-relative-import
-from queensguard.const import WEAVIATE_MEMORY_COLLECTION
+from ..const import WEAVIATE_MEMORY_COLLECTION  # noqa: TID252
 
 _LOGGER = logging.getLogger(__name__)
 

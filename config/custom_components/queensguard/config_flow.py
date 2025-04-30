@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import logging
 from typing import Any
 
@@ -12,14 +11,7 @@ from ollama import ResponseError
 import voluptuous as vol
 import weaviate
 
-from homeassistant.config_entries import (
-    SOURCE_RECONFIGURE,
-    ConfigEntry,
-    ConfigFlow,
-    ConfigFlowResult,
-    OptionsFlow,
-)
-from homeassistant.core import callback
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
@@ -29,9 +21,11 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+# Add import for new Places API config
 from .const import (
     CONF_EMBEDDING_MODEL,
     CONF_OLLAMA_URL,
+    CONF_PLACES_API_KEY,
     CONF_WEAVIATE_API_KEY,
     CONF_WEAVIATE_URL,
     DEFAULT_EMBEDDING_MODEL,
@@ -40,33 +34,15 @@ from .const import (
     DOMAIN,
     EMBEDDING_MODELS,
 )
-from .memory.service import MemoryManager
 from .util import create_ollama_client, create_weaviate_client
 
 _LOGGER = logging.getLogger(__name__)
-
-
-@dataclass
-class QueensGuardData:
-    """Data for QueensGuard integration."""
-
-    ollama: ollama.AsyncClient
-    weaviate: weaviate.WeaviateClient
-    memory_manager: MemoryManager
 
 
 class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Queen's Guard integration."""
 
     VERSION = 1
-
-    @staticmethod
-    @callback
-    def async_get_options_flow(
-        config_entry: ConfigEntry,
-    ) -> QueensGuardOptionsFlowHandler:
-        """Get the options flow for this handler."""
-        return QueensGuardOptionsFlowHandler()
 
     def __init__(self) -> None:
         """Initialize config flow."""
@@ -78,6 +54,7 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
         self.download_task: asyncio.Task | None = None
         self.weaviate_client: weaviate.WeaviateClient | None = None
         self.downloaded_models: set[str] = set()
+        self.places_api_key: str | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -91,6 +68,9 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
             self.ollama_url = user_input.get(CONF_OLLAMA_URL, self.ollama_url)
             self.embedding_model = user_input.get(
                 CONF_EMBEDDING_MODEL, self.embedding_model
+            )
+            self.places_api_key = user_input.get(
+                CONF_PLACES_API_KEY, self.places_api_key
             )
 
             # If we have URLs but no model yet, proceed to connection testing
@@ -118,7 +98,12 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
                     return await self.async_step_select_model()
 
             # If we have all info, create the entry
-            elif self.weaviate_url and self.ollama_url and self.embedding_model:
+            elif (
+                self.weaviate_url
+                and self.ollama_url
+                and self.embedding_model
+                and self.places_api_key
+            ):
                 return self.async_create_entry(
                     title=DEFAULT_NAME,
                     data={
@@ -126,24 +111,17 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_WEAVIATE_API_KEY: self.weaviate_api_key,
                         CONF_OLLAMA_URL: self.ollama_url,
                         CONF_EMBEDDING_MODEL: self.embedding_model,
+                        CONF_PLACES_API_KEY: self.places_api_key,
                     },
                 )
 
         # If there is no user input or there were errors, show the form again
-        schema = vol.Schema(
-            {
-                vol.Required(
-                    CONF_WEAVIATE_URL,
-                    default=self.weaviate_url if self.weaviate_url else None,
-                ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
-                # vol.Optional(CONF_WEAVIATE_API_KEY): TextSelector(
-                #     TextSelectorConfig(type=TextSelectorType.PASSWORD)
-                # ),
-                vol.Required(
-                    CONF_OLLAMA_URL,
-                    default=self.ollama_url if self.ollama_url else None,
-                ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
-            }
+        schema = _queensguard_config_schema(
+            weaviate_url=self.weaviate_url or "",
+            weaviate_api_key=self.weaviate_api_key,
+            ollama_url=self.ollama_url or "",
+            embedding_model=self.embedding_model or DEFAULT_EMBEDDING_MODEL,
+            places_api_key=self.places_api_key,
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
@@ -166,6 +144,7 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_WEAVIATE_API_KEY: self.weaviate_api_key,
                     CONF_OLLAMA_URL: self.ollama_url,
                     CONF_EMBEDDING_MODEL: self.embedding_model,
+                    CONF_PLACES_API_KEY: self.places_api_key,
                 },
             )
 
@@ -238,6 +217,7 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_WEAVIATE_API_KEY: self.weaviate_api_key,
                 CONF_OLLAMA_URL: self.ollama_url,
                 CONF_EMBEDDING_MODEL: self.embedding_model,
+                CONF_PLACES_API_KEY: self.places_api_key,
             },
         )
 
@@ -252,17 +232,21 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Reconfigure connection settings."""
         errors: dict[str, str] = {}
-        entry = self.current_entry
-        assert entry  # Should exist for reconfigure
+        entry = self._get_reconfigure_entry()
+
+        # Get current values from entry for form defaults
+        weaviate_url = entry.data.get(CONF_WEAVIATE_URL, "")
+        weaviate_api_key = entry.data.get(CONF_WEAVIATE_API_KEY)
+        ollama_url = entry.data.get(CONF_OLLAMA_URL, "")
+        embedding_model = entry.data.get(CONF_EMBEDDING_MODEL, DEFAULT_EMBEDDING_MODEL)
+        places_api_key = entry.data.get(CONF_PLACES_API_KEY)
 
         if user_input is not None:
             weaviate_url = user_input[CONF_WEAVIATE_URL]
             weaviate_api_key = user_input.get(CONF_WEAVIATE_API_KEY)
             ollama_url = user_input[CONF_OLLAMA_URL]
-            embedding_model = user_input.get(
-                CONF_EMBEDDING_MODEL,
-                entry.data.get(CONF_EMBEDDING_MODEL, DEFAULT_EMBEDDING_MODEL),
-            )
+            embedding_model = user_input.get(CONF_EMBEDDING_MODEL, embedding_model)
+            places_api_key = user_input.get(CONF_PLACES_API_KEY, places_api_key)
 
             # Test connections to both services
             weaviate_error = await self._test_weaviate_connection(
@@ -277,44 +261,30 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
 
             # Ensure the model is available or can be downloaded
             if not ollama_error and embedding_model not in models:
-                # We'll need to download - but that happens in a separate step
                 self.weaviate_url = weaviate_url
                 self.weaviate_api_key = weaviate_api_key
                 self.ollama_url = ollama_url
                 self.embedding_model = embedding_model
+                self.places_api_key = places_api_key
                 return await self.async_step_download()
 
             if not errors:
-                _LOGGER.debug("Successfully connected to Weaviate and Ollama")
+                _LOGGER.debug("Successfully reconfigured Weaviate and Ollama")
                 data = {
                     CONF_WEAVIATE_URL: weaviate_url,
                     CONF_WEAVIATE_API_KEY: weaviate_api_key,
                     CONF_OLLAMA_URL: ollama_url,
                     CONF_EMBEDDING_MODEL: embedding_model,
+                    CONF_PLACES_API_KEY: places_api_key,
                 }
                 return self.async_update_reload_and_abort(entry, data=data)
 
-        # Get current values from entry
-        weaviate_url = entry.data.get(CONF_WEAVIATE_URL, "")
-        weaviate_api_key = entry.data.get(CONF_WEAVIATE_API_KEY)
-        ollama_url = entry.data.get(CONF_OLLAMA_URL, "")
-        embedding_model = entry.data.get(CONF_EMBEDDING_MODEL, DEFAULT_EMBEDDING_MODEL)
-
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_WEAVIATE_URL, default=weaviate_url): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.URL)
-                ),
-                vol.Optional(
-                    CONF_WEAVIATE_API_KEY, default=weaviate_api_key
-                ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
-                vol.Required(CONF_OLLAMA_URL, default=ollama_url): TextSelector(
-                    TextSelectorConfig(type=TextSelectorType.URL)
-                ),
-                vol.Required(
-                    CONF_EMBEDDING_MODEL, default=embedding_model
-                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
-            }
+        schema = _queensguard_config_schema(
+            weaviate_url=weaviate_url,
+            weaviate_api_key=weaviate_api_key,
+            ollama_url=ollama_url,
+            embedding_model=embedding_model,
+            places_api_key=places_api_key,
         )
 
         return self.async_show_form(
@@ -388,26 +358,31 @@ class QueensGuardConfigFlow(ConfigFlow, domain=DOMAIN):
             return None, downloaded_models
 
 
-class QueensGuardOptionsFlowHandler(OptionsFlow):
-    """Handle Queen's Guard options."""
-
-    async def async_step_init(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Manage the options."""
-        # Options flow should redirect to reconfigure to allow changing URLs/API key
-        return await self.async_step_reconfigure()
-
-    async def async_step_reconfigure(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Reconfigure the integration."""
-        # Start the reconfigure flow by transferring to the ConfigFlow reconfigure step
-        return await self.hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={
-                "source": SOURCE_RECONFIGURE,
-                "entry_id": self.config_entry.entry_id,
-            },
-            data=self.config_entry.data,
-        )
+def _queensguard_config_schema(
+    *,
+    weaviate_url: str = "",
+    weaviate_api_key: str | None = None,
+    ollama_url: str = "",
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    places_api_key: str | None = None,
+) -> vol.Schema:
+    """Return the config schema for Queen's Guard config flow."""
+    return vol.Schema(
+        {
+            vol.Optional(CONF_WEAVIATE_API_KEY, default=weaviate_api_key): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.PASSWORD)
+            ),
+            vol.Required(CONF_WEAVIATE_URL, default=weaviate_url): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.URL)
+            ),
+            vol.Required(CONF_OLLAMA_URL, default=ollama_url): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.URL)
+            ),
+            vol.Required(CONF_EMBEDDING_MODEL, default=embedding_model): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.TEXT)
+            ),
+            vol.Optional(CONF_PLACES_API_KEY, default=places_api_key): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.PASSWORD)
+            ),
+        }
+    )

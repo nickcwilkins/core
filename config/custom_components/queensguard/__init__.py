@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
-from typing import cast
 
+import ollama
 import weaviate
 
 from homeassistant.config_entries import ConfigEntry
@@ -17,17 +18,35 @@ from homeassistant.helpers.typing import ConfigType
 from .const import (
     CONF_EMBEDDING_MODEL,
     CONF_OLLAMA_URL,
+    CONF_PLACES_API_KEY,
     CONF_WEAVIATE_API_KEY,
     CONF_WEAVIATE_URL,
     DOMAIN,
 )
 from .memory.api import MemoryAPI
 from .memory.service import MemoryManager
+from .places.api import PlaceAPI
+from .places.service import PlaceService
 from .util import create_ollama_client, create_weaviate_client
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = []  # No platforms needed for now
+
+type QueensGuardConfigEntry = ConfigEntry[QueensGuardData]
+
+
+@dataclass
+class QueensGuardData:
+    """Data for QueensGuard integration."""
+
+    places_api_key: str | None
+    weaviate_url: str
+    weaviate_api_key: str | None
+    ollama_url: str
+    ollama_client: ollama.AsyncClient
+    weaviate_client: weaviate.WeaviateClient
+    memory_manager: MemoryManager
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -37,12 +56,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: QueensGuardConfigEntry) -> bool:
     """Set up Queen's Guard from a config entry."""
-    weaviate_url = cast(str, entry.data[CONF_WEAVIATE_URL])
+    weaviate_url = entry.data[CONF_WEAVIATE_URL]
     weaviate_api_key = entry.data.get(CONF_WEAVIATE_API_KEY)
-    ollama_url = cast(str, entry.data[CONF_OLLAMA_URL])
-    embedding_model = cast(str, entry.data[CONF_EMBEDDING_MODEL])
+    ollama_url = entry.data.get(CONF_OLLAMA_URL)
+    embedding_model = entry.data.get(CONF_EMBEDDING_MODEL)
+    places_api_key = entry.data.get(CONF_PLACES_API_KEY)
 
     _LOGGER.info(
         "Setting up Queen's Guard with Weaviate: %s, Ollama: %s, Embedding Model: %s",
@@ -79,19 +99,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(f"Failed to setup Memory Manager: {err}") from err
 
     # Create the API instance with a reference to the memory manager
-    api = MemoryAPI(hass, memory_manager)
+    memory_api = MemoryAPI(hass, memory_manager)
 
     # Register the API with Home Assistant's LLM system
-    unregister_api = async_register_api(hass, api)
+    unregister_memory_api = async_register_api(hass, memory_api)
 
     # Store components in the hass data registry
     hass.data[DOMAIN][entry.entry_id] = {
-        "api": api,
+        "memory_api": memory_api,
         "memory_manager": memory_manager,
         "weaviate_client": weaviate_client,
         "ollama_client": ollama_client,
-        "unregister_api": unregister_api,
+        "unregister_memory_api": unregister_memory_api,
     }
+
+    if places_api_key:
+        place_service = PlaceService(
+            api_key=places_api_key,
+        )
+        place_api = PlaceAPI(
+            hass=hass,
+            api=place_service,
+        )
+        hass.data[DOMAIN][entry.entry_id]["place_service"] = place_service
+        hass.data[DOMAIN][entry.entry_id]["place_api"] = place_api
+        _LOGGER.info("Initialized Google Maps client with API key")
+    else:
+        _LOGGER.warning("No Google Maps API key provided; places API disabled")
 
     # Set up options listener
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
@@ -107,8 +141,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = hass.data[DOMAIN].pop(entry.entry_id)
 
     # Unregister API from LLM system
-    if "unregister_api" in data:
-        data["unregister_api"]()
+    if "unregister_memory_api" in data:
+        data["unregister_memory_api"]()
+
+    if "unregister_places_api" in data:
+        data["unregister_places_api"]()
 
     # Unload memory manager (add async_unload if needed)
     # if "memory_manager" in data:
